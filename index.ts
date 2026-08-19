@@ -4,9 +4,11 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import {
   EXPIRY_MARGIN_MS,
+  awsConfigPath,
   cacheKeyForProfile,
   freshness,
   parseIni,
+  resolveProfileName,
   tokenCacheFilename,
   type IniSections,
   type TokenState,
@@ -34,17 +36,10 @@ const WARNING_TOAST_MS = 60_000
 // data.message.
 const CREDENTIAL_ERROR = "AWS credential provider failed"
 
-const resolveProfile = (options?: Record<string, unknown>): string | undefined => {
-  const configured = options?.["profile"]
-  if (typeof configured === "string" && configured.length > 0) return configured
-  const fromEnv = process.env.AWS_PROFILE
-  return fromEnv && fromEnv.length > 0 ? fromEnv : undefined
-}
-
 const deriveTokenCachePath = (profile: string): string | undefined => {
   let sections: IniSections
   try {
-    sections = parseIni(readFileSync(process.env.AWS_CONFIG_FILE ?? join(homedir(), ".aws", "config"), "utf8"))
+    sections = parseIni(readFileSync(awsConfigPath(process.env, homedir()), "utf8"))
   } catch {
     return undefined
   }
@@ -164,7 +159,7 @@ export default (async ({ $, client }) => {
 
   return {
     config: async (cfg) => {
-      profile = resolveProfile(cfg.provider?.["amazon-bedrock"]?.options)
+      profile = resolveProfileName(undefined, cfg.provider?.["amazon-bedrock"]?.options?.["profile"], process.env)
       if (!profile) {
         startupNotice = "No AWS profile configured for Bedrock, so SSO checks are disabled."
         return

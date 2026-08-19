@@ -21,7 +21,9 @@ export const parseIni = (text: string): IniSections => {
 
     const header = /^\[(.+)\]$/.exec(line)
     if (header) {
-      const name = header[1].trim()
+      // botocore strips surrounding quotes from section names, so
+      // [profile "with space"] and [profile with space] are the same profile.
+      const name = header[1].trim().replace(/^(profile\s+)?"(.*)"$/, "$1$2")
       if (!sections[name]) sections[name] = {}
       current = sections[name]
       continue
@@ -40,10 +42,40 @@ export const parseIni = (text: string): IniSections => {
 // session-style profiles, or of sso_start_url for legacy ones. Returning
 // undefined means the profile is not SSO-backed, which callers must treat as
 // "do not attempt a login" rather than "expired".
+// botocore accepts both [default] and [profile default], preferring the former.
+export const sectionNameForProfile = (profile: string): string[] =>
+  profile === "default" ? ["default", "profile default"] : [`profile ${profile}`]
+
 export const cacheKeyForProfile = (sections: IniSections, profile: string): string | undefined => {
-  const section = sections[profile === "default" ? "default" : `profile ${profile}`]
-  if (!section) return undefined
-  return section["sso_session"] ?? section["sso_start_url"]
+  for (const name of sectionNameForProfile(profile)) {
+    const section = sections[name]
+    if (!section) continue
+    const cacheKey = section["sso_session"] ?? section["sso_start_url"]
+    if (cacheKey) return cacheKey
+  }
+  return undefined
+}
+
+const nonEmptyString = (value: unknown): string | undefined =>
+  typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
+
+// AWS_DEFAULT_PROFILE is honoured by botocore and was previously ignored here.
+export const resolveProfileName = (
+  pluginProfile: unknown,
+  providerProfile: unknown,
+  env: Record<string, string | undefined>,
+): string | undefined =>
+  nonEmptyString(pluginProfile) ??
+  nonEmptyString(providerProfile) ??
+  nonEmptyString(env["AWS_PROFILE"]) ??
+  nonEmptyString(env["AWS_DEFAULT_PROFILE"])
+
+export const awsConfigPath = (env: Record<string, string | undefined>, home: string): string => {
+  const configured = nonEmptyString(env["AWS_CONFIG_FILE"])
+  if (!configured) return `${home}/.aws/config`
+  // The shell expands ~ before a program sees it, but a value read from a config
+  // file or a systemd unit arrives literally.
+  return configured.startsWith("~/") ? `${home}/${configured.slice(2)}` : configured
 }
 
 export const tokenCacheFilename = (cacheKey: string): string =>
