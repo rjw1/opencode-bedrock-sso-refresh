@@ -24,12 +24,13 @@ intervention:
    you to resend the message.
 
 If neither `provider.amazon-bedrock.options.profile` nor `AWS_PROFILE` names
-an SSO-backed profile, or another AWS credential source is already
-configured (see below), the plugin does nothing beyond a one-time notice.
+an SSO-backed profile, the plugin does nothing beyond a one-time notice. If
+another AWS credential source is already configured (see below), it steps
+aside silently instead.
 
 ## Install
 
-opencode does not (yet) install this from npm. Add it to your opencode
+This project has not published an npm release. Add it to your opencode
 config as a git dependency:
 
 ```json
@@ -63,9 +64,9 @@ do not have.
 - **No npm release.** Install from the git repository, as above.
 - **No agent-callable refresh tool.** The agent cannot ask the plugin to
   re-authenticate on demand; refresh only happens at the three points above.
-- **No login timeout, by default.** If `aws sso login` opens a browser and
-  nobody completes the flow, the request waits indefinitely. The toast
-  includes the equivalent command to run by hand if that happens.
+- **No login timeout.** If `aws sso login` opens a browser and nobody
+  completes the flow, the request waits indefinitely. The toast includes
+  the equivalent command to run by hand if that happens.
 
 ## Compared to other plugins
 
