@@ -7,6 +7,7 @@ import {
   awsConfigPath,
   cacheKeyForProfile,
   freshness,
+  nonEmptyString,
   otherCredentialSource,
   parseIni,
   resolveProfileName,
@@ -89,8 +90,8 @@ export default (async ({ $, client }, options) => {
   // 0 or absent means no timeout, which is the existing behaviour: aws sso login
   // is already bounded by the device code expiry.
   const loginTimeoutMs = positiveNumber(options?.["loginTimeoutMs"], 0)
-  const awsCommand = typeof options?.["awsCommand"] === "string" ? options["awsCommand"] : "aws"
-  const providerID = typeof options?.["providerID"] === "string" ? options["providerID"] : "amazon-bedrock"
+  const awsCommand = nonEmptyString(options?.["awsCommand"]) ?? "aws"
+  const providerID = nonEmptyString(options?.["providerID"]) ?? "amazon-bedrock"
   const optionProfile = options?.["profile"]
 
   let profile: string | undefined

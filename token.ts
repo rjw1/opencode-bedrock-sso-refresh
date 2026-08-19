@@ -56,7 +56,9 @@ export const cacheKeyForProfile = (sections: IniSections, profile: string): stri
   return undefined
 }
 
-const nonEmptyString = (value: unknown): string | undefined =>
+// Exported so index.ts can validate string options without a second copy of the
+// rule. A user can put anything in the options JSON, including an empty string.
+export const nonEmptyString = (value: unknown): string | undefined =>
   typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
 
 // AWS_DEFAULT_PROFILE is honoured by botocore and was previously ignored here.
