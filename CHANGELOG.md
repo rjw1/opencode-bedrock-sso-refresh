@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Startup, pre-flight and reactive diagnostics now go to opencode's log
+  (`client.app.log`) instead of `console.log`, which plugins cannot reach
+  from the TUI or opencode's own log file. The deferred `startupNotice`
+  toast workaround, needed only because that was wrongly assumed
+  unreachable from the `config` hook, is gone; toasts remain for states
+  the user has to act on.
+- `ReauthResult` no longer overloads `"not-stale"` for the circuit-breaker
+  and no-profile cases, so the reactive "the token looks valid" message no
+  longer appears when the token was never checked — including for users on
+  bearer tokens, static keys or container credentials, who have no token
+  at all.
+- Corrected the comment above `tokenState`: an unreadable cache file reads
+  as stale, not unknown, and does drive a login.
+
+
 ## [0.1.0] - 2026-08-19
 
 First release. An opencode plugin that keeps the AWS SSO token behind the

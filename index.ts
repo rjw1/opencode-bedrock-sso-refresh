@@ -25,7 +25,7 @@ import {
 // The profile is resolved from provider.amazon-bedrock.options.profile, then
 // AWS_PROFILE. If neither is set the plugin does nothing beyond warning once.
 
-type ReauthResult = "not-stale" | "recovered" | "failed"
+type ReauthResult = "not-stale" | "recovered" | "failed" | "disabled" | "no-profile"
 
 // Toasts default to 5s, but the re-auth warning carries the fallback command for
 // a browser that never opens -- a state that leaves the request hanging for
@@ -36,6 +36,16 @@ const WARNING_TOAST_MS = 60_000
 // rejects. Reaches the bus as ProviderAuthError or UnknownError; both carry
 // data.message.
 const CREDENTIAL_ERROR = "AWS credential provider failed"
+
+// Mirrors hasOtherCredentialSource's checks in order, purely to name which one
+// fired for the diagnostic log -- token.ts stays a boolean-only predicate.
+const otherCredentialSourceName = (env: Record<string, string | undefined>): string => {
+  if (env["AWS_BEARER_TOKEN_BEDROCK"]) return "AWS_BEARER_TOKEN_BEDROCK"
+  if (env["AWS_ACCESS_KEY_ID"] && env["AWS_SECRET_ACCESS_KEY"]) return "AWS_ACCESS_KEY_ID"
+  if (env["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"]) return "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
+  if (env["AWS_CONTAINER_CREDENTIALS_FULL_URI"]) return "AWS_CONTAINER_CREDENTIALS_FULL_URI"
+  return "AWS_WEB_IDENTITY_TOKEN_FILE"
+}
 
 const deriveTokenCachePath = (profile: string): string | undefined => {
   let sections: IniSections
@@ -58,8 +68,9 @@ const tokenCachePath = (profile: string): string | undefined => {
   return cachedPath.path
 }
 
-// A missing cache file for an SSO-backed profile is stale; anything unreadable
-// is unknown, which never drives a login.
+// A missing or otherwise unreadable cache file for an SSO-backed profile reads as
+// stale, because an unusable cache is grounds to re-authenticate. Only a profile
+// with no SSO configuration, or a cache whose expiry will not parse, is unknown.
 const tokenState = (profile: string): TokenState => {
   const path = tokenCachePath(profile)
   if (!path) return "unknown"
@@ -85,9 +96,6 @@ export default (async ({ $, client }) => {
   // the cache-path derivation is wrong on this machine. Without it, a wrong
   // derivation means a browser prompt on every single request, forever.
   let autoReauthDisabled = false
-  // The config hook runs before the TUI attaches, so anything startup wants to
-  // say has to wait for a request to carry it.
-  let startupNotice: string | undefined
 
   const login = (target: string) => {
     const existing = inFlightLogins.get(target)
@@ -116,10 +124,23 @@ export default (async ({ $, client }) => {
     await client.tui.showToast({ body: { title: "AWS SSO", message, variant, duration } }).catch(() => {})
   }
 
+  // Plugin console output reaches neither the TUI nor opencode's log file, but
+  // app.log does, which is where anything diagnostic rather than actionable goes.
+  const log = async (level: "debug" | "info" | "warn" | "error", message: string) => {
+    await client.app
+      .log({ body: { service: "opencode-bedrock-sso-refresh", level, message } })
+      .catch(() => {})
+  }
+
   const reauthenticateIfStale = async (resend: boolean): Promise<ReauthResult> => {
-    if (!profile || autoReauthDisabled) return "not-stale"
+    if (!profile) return "no-profile"
+    if (autoReauthDisabled) {
+      await log("error", `Circuit breaker tripped for ${profile}; skipping automatic re-authentication.`)
+      return "disabled"
+    }
     if (tokenState(profile) !== "stale") return "not-stale"
 
+    await log("info", `Token for ${profile} is stale; logging in.`)
     await toast(
       `Token for ${profile} has expired. Opening the browser to re-authenticate... ` +
         `If none opens, run: aws sso login --profile ${profile}`,
@@ -128,6 +149,7 @@ export default (async ({ $, client }) => {
     )
     const result = await login(profile)
     if (!result.ok) {
+      await log("error", `aws sso login failed for ${profile}. ${result.detail}`)
       await toast(`aws sso login failed for ${profile}. Run it manually. ${result.detail}`, "error")
       return "failed"
     }
@@ -155,7 +177,9 @@ export default (async ({ $, client }) => {
 
     const result = await login(target)
     if (!result.ok) {
-      startupNotice = `aws sso login failed for ${target} at startup. Run it manually. ${result.detail}`
+      const notice = `aws sso login failed for ${target} at startup. Run it manually. ${result.detail}`
+      await log("error", notice)
+      await toast(notice, "warning", WARNING_TOAST_MS)
     }
   }
 
@@ -163,17 +187,22 @@ export default (async ({ $, client }) => {
     config: async (cfg) => {
       profile = resolveProfileName(undefined, cfg.provider?.["amazon-bedrock"]?.options?.["profile"], process.env)
       if (hasOtherCredentialSource(process.env)) {
+        await log(
+          "info",
+          `${otherCredentialSourceName(process.env)} is set, so this plugin is not managing credentials.`,
+        )
         profile = undefined
         return
       }
       if (!profile) {
-        startupNotice = "No AWS profile configured for Bedrock, so SSO checks are disabled."
+        await log("warn", "No AWS profile configured for Bedrock, so SSO checks are disabled.")
         return
       }
       if (!tokenCachePath(profile)) {
-        startupNotice =
-          `${profile} sets neither sso_session nor sso_start_url, ` +
-          `so pre-flight token checks are disabled.`
+        await log(
+          "warn",
+          `${profile} sets neither sso_session nor sso_start_url, so pre-flight token checks are disabled.`,
+        )
       }
       await ensureSession(profile)
     },
@@ -182,12 +211,6 @@ export default (async ({ $, client }) => {
     // point: the request then proceeds against a fresh token instead of failing.
     "chat.params": async (input) => {
       if (input.model.providerID !== "amazon-bedrock") return
-      if (startupNotice) {
-        const notice = startupNotice
-        // Cleared before awaiting so overlapping requests cannot both toast it.
-        startupNotice = undefined
-        await toast(notice, "warning", WARNING_TOAST_MS)
-      }
       await reauthenticateIfStale(false)
     },
 
@@ -201,8 +224,25 @@ export default (async ({ $, client }) => {
       // expiry -- a wrong profile, a missing aws-sso-util, a network fault --
       // and opening a browser would loop on every retry. The failed request
       // cannot be resumed from a plugin, hence the request to resend.
-      if ((await reauthenticateIfStale(true)) === "not-stale") {
+      const result = await reauthenticateIfStale(true)
+      if (result === "not-stale") {
+        await log("warn", `Bedrock credentials failed despite a fresh token. ${message}`)
         await toast(`Bedrock credentials failed, but the token looks valid. ${message}`, "error")
+      } else if (result === "no-profile") {
+        // No profile means no token, so "the token looks valid" is meaningless to
+        // a user on bearer-token, static-key or container credentials.
+        await toast(
+          `Bedrock credentials failed. This plugin is not managing credentials ` +
+            `for this setup, so it cannot help. ${message}`,
+          "error",
+        )
+      } else if (result === "disabled") {
+        await toast(
+          `Bedrock credentials failed and automatic re-authentication is disabled ` +
+            `for this session. Run: aws sso login --profile ${profile}. ${message}`,
+          "error",
+          WARNING_TOAST_MS,
+        )
       }
     },
   }
