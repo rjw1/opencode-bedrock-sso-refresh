@@ -92,11 +92,13 @@ export const freshness = (expiresAt: unknown, marginMs: number, now: number): To
 
 // opencode's own Bedrock provider prefers these over a profile, so when any is
 // present an SSO login is pointless and would just interrupt a working setup.
-export const hasOtherCredentialSource = (env: Record<string, string | undefined>): boolean =>
-  Boolean(
-    env["AWS_BEARER_TOKEN_BEDROCK"] ||
-      (env["AWS_ACCESS_KEY_ID"] && env["AWS_SECRET_ACCESS_KEY"]) ||
-      env["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] ||
-      env["AWS_CONTAINER_CREDENTIALS_FULL_URI"] ||
-      (env["AWS_WEB_IDENTITY_TOKEN_FILE"] && env["AWS_ROLE_ARN"]),
-  )
+// Returns the variable that decided it, so callers can say which one without
+// duplicating these rules.
+export const otherCredentialSource = (env: Record<string, string | undefined>): string | undefined => {
+  if (env["AWS_BEARER_TOKEN_BEDROCK"]) return "AWS_BEARER_TOKEN_BEDROCK"
+  if (env["AWS_ACCESS_KEY_ID"] && env["AWS_SECRET_ACCESS_KEY"]) return "AWS_ACCESS_KEY_ID"
+  if (env["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"]) return "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
+  if (env["AWS_CONTAINER_CREDENTIALS_FULL_URI"]) return "AWS_CONTAINER_CREDENTIALS_FULL_URI"
+  if (env["AWS_WEB_IDENTITY_TOKEN_FILE"] && env["AWS_ROLE_ARN"]) return "AWS_WEB_IDENTITY_TOKEN_FILE"
+  return undefined
+}

@@ -7,7 +7,7 @@ import {
   awsConfigPath,
   cacheKeyForProfile,
   freshness,
-  hasOtherCredentialSource,
+  otherCredentialSource,
   parseIni,
   resolveProfileName,
   tokenCacheFilename,
@@ -36,16 +36,6 @@ const WARNING_TOAST_MS = 60_000
 // rejects. Reaches the bus as ProviderAuthError or UnknownError; both carry
 // data.message.
 const CREDENTIAL_ERROR = "AWS credential provider failed"
-
-// Mirrors hasOtherCredentialSource's checks in order, purely to name which one
-// fired for the diagnostic log -- token.ts stays a boolean-only predicate.
-const otherCredentialSourceName = (env: Record<string, string | undefined>): string => {
-  if (env["AWS_BEARER_TOKEN_BEDROCK"]) return "AWS_BEARER_TOKEN_BEDROCK"
-  if (env["AWS_ACCESS_KEY_ID"] && env["AWS_SECRET_ACCESS_KEY"]) return "AWS_ACCESS_KEY_ID"
-  if (env["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"]) return "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
-  if (env["AWS_CONTAINER_CREDENTIALS_FULL_URI"]) return "AWS_CONTAINER_CREDENTIALS_FULL_URI"
-  return "AWS_WEB_IDENTITY_TOKEN_FILE"
-}
 
 const deriveTokenCachePath = (profile: string): string | undefined => {
   let sections: IniSections
@@ -134,10 +124,7 @@ export default (async ({ $, client }) => {
 
   const reauthenticateIfStale = async (resend: boolean): Promise<ReauthResult> => {
     if (!profile) return "no-profile"
-    if (autoReauthDisabled) {
-      await log("error", `Circuit breaker tripped for ${profile}; skipping automatic re-authentication.`)
-      return "disabled"
-    }
+    if (autoReauthDisabled) return "disabled"
     if (tokenState(profile) !== "stale") return "not-stale"
 
     await log("info", `Token for ${profile} is stale; logging in.`)
@@ -156,6 +143,7 @@ export default (async ({ $, client }) => {
 
     if (tokenState(profile) === "stale") {
       autoReauthDisabled = true
+      await log("error", `Circuit breaker tripped for ${profile}; disabling automatic re-authentication.`)
       await toast(
         `aws sso login for ${profile} succeeded but the token still reads as stale. ` +
           `Automatic re-authentication is disabled for the rest of this session.`,
@@ -186,11 +174,9 @@ export default (async ({ $, client }) => {
   return {
     config: async (cfg) => {
       profile = resolveProfileName(undefined, cfg.provider?.["amazon-bedrock"]?.options?.["profile"], process.env)
-      if (hasOtherCredentialSource(process.env)) {
-        await log(
-          "info",
-          `${otherCredentialSourceName(process.env)} is set, so this plugin is not managing credentials.`,
-        )
+      const credentialSource = otherCredentialSource(process.env)
+      if (credentialSource) {
+        await log("info", `${credentialSource} is set, so this plugin is not managing credentials.`)
         profile = undefined
         return
       }
