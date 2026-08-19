@@ -89,3 +89,14 @@ export const freshness = (expiresAt: unknown, marginMs: number, now: number): To
   if (Number.isNaN(expiry)) return "unknown"
   return expiry - now > marginMs ? "fresh" : "stale"
 }
+
+// opencode's own Bedrock provider prefers these over a profile, so when any is
+// present an SSO login is pointless and would just interrupt a working setup.
+export const hasOtherCredentialSource = (env: Record<string, string | undefined>): boolean =>
+  Boolean(
+    env["AWS_BEARER_TOKEN_BEDROCK"] ||
+      (env["AWS_ACCESS_KEY_ID"] && env["AWS_SECRET_ACCESS_KEY"]) ||
+      env["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] ||
+      env["AWS_CONTAINER_CREDENTIALS_FULL_URI"] ||
+      (env["AWS_WEB_IDENTITY_TOKEN_FILE"] && env["AWS_ROLE_ARN"]),
+  )

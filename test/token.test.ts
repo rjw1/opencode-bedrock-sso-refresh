@@ -4,6 +4,7 @@ import {
   awsConfigPath,
   cacheKeyForProfile,
   freshness,
+  hasOtherCredentialSource,
   parseIni,
   resolveProfileName,
   tokenCacheFilename,
@@ -138,4 +139,27 @@ test("awsConfigPath uses AWS_CONFIG_FILE verbatim when absolute", () => {
 
 test("awsConfigPath defaults to ~/.aws/config", () => {
   assert.equal(awsConfigPath({}, "/home/b"), "/home/b/.aws/config")
+})
+
+test("hasOtherCredentialSource detects a Bedrock bearer token", () => {
+  assert.equal(hasOtherCredentialSource({ AWS_BEARER_TOKEN_BEDROCK: "t" }), true)
+})
+
+test("hasOtherCredentialSource needs both halves of a static key pair", () => {
+  assert.equal(hasOtherCredentialSource({ AWS_ACCESS_KEY_ID: "AKIA" }), false)
+  assert.equal(hasOtherCredentialSource({ AWS_ACCESS_KEY_ID: "AKIA", AWS_SECRET_ACCESS_KEY: "s" }), true)
+})
+
+test("hasOtherCredentialSource detects either container credential variable", () => {
+  assert.equal(hasOtherCredentialSource({ AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: "/x" }), true)
+  assert.equal(hasOtherCredentialSource({ AWS_CONTAINER_CREDENTIALS_FULL_URI: "http://x" }), true)
+})
+
+test("hasOtherCredentialSource needs both halves of web identity", () => {
+  assert.equal(hasOtherCredentialSource({ AWS_WEB_IDENTITY_TOKEN_FILE: "/f" }), false)
+  assert.equal(hasOtherCredentialSource({ AWS_WEB_IDENTITY_TOKEN_FILE: "/f", AWS_ROLE_ARN: "arn" }), true)
+})
+
+test("hasOtherCredentialSource is false for a plain SSO setup", () => {
+  assert.equal(hasOtherCredentialSource({ AWS_PROFILE: "p" }), false)
 })

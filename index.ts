@@ -7,6 +7,7 @@ import {
   awsConfigPath,
   cacheKeyForProfile,
   freshness,
+  hasOtherCredentialSource,
   parseIni,
   resolveProfileName,
   tokenCacheFilename,
@@ -79,7 +80,7 @@ const tokenState = (profile: string): TokenState => {
 
 export default (async ({ $, client }) => {
   let profile: string | undefined
-  let inFlightLogin: Promise<{ ok: boolean; detail: string }> | undefined
+  const inFlightLogins = new Map<string, Promise<{ ok: boolean; detail: string }>>()
   // Set once a login reports success but tokenState still reads stale, meaning
   // the cache-path derivation is wrong on this machine. Without it, a wrong
   // derivation means a browser prompt on every single request, forever.
@@ -88,22 +89,23 @@ export default (async ({ $, client }) => {
   // say has to wait for a request to carry it.
   let startupNotice: string | undefined
 
-  // Single-flight, so overlapping callers await one browser flow instead of
-  // opening two and racing on the token cache.
   const login = (target: string) => {
-    if (!inFlightLogin) {
-      inFlightLogin = $`aws sso login --profile ${target}`
-        .quiet()
-        .nothrow()
-        .then((result) => ({
-          ok: result.exitCode === 0,
-          detail: (result.stderr.toString().trim() || result.stdout.toString().trim()).slice(-300),
-        }))
-        .finally(() => {
-          inFlightLogin = undefined
-        })
-    }
-    return inFlightLogin
+    const existing = inFlightLogins.get(target)
+    if (existing) return existing
+
+    const attempt = $`aws sso login --profile ${target}`
+      .quiet()
+      .nothrow()
+      .then((result) => ({
+        ok: result.exitCode === 0,
+        detail: (result.stderr.toString().trim() || result.stdout.toString().trim()).slice(-300),
+      }))
+      .finally(() => {
+        inFlightLogins.delete(target)
+      })
+
+    inFlightLogins.set(target, attempt)
+    return attempt
   }
 
   const toast = async (
@@ -160,6 +162,10 @@ export default (async ({ $, client }) => {
   return {
     config: async (cfg) => {
       profile = resolveProfileName(undefined, cfg.provider?.["amazon-bedrock"]?.options?.["profile"], process.env)
+      if (hasOtherCredentialSource(process.env)) {
+        profile = undefined
+        return
+      }
       if (!profile) {
         startupNotice = "No AWS profile configured for Bedrock, so SSO checks are disabled."
         return
