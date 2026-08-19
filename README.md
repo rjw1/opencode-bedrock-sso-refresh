@@ -41,6 +41,33 @@ config as a git dependency:
 }
 ```
 
+## Options
+
+Configure the plugin using the tuple form of opencode's `plugin` config
+entry:
+
+```json
+{
+  "plugin": [
+    ["opencode-bedrock-sso-refresh@git+https://github.com/rjw1/opencode-bedrock-sso-refresh.git",
+     { "marginMs": 600000 }]
+  ]
+}
+```
+
+| Option           | Type     | Default          | Effect |
+| ---------------- | -------- | ---------------- | ------ |
+| `marginMs`       | `number` | `300000` (5 min) | How far ahead of the token's expiry to treat it as stale and re-authenticate. |
+| `toastMs`        | `number` | `60000` (60 s)   | How long the re-authentication warning toast stays on screen. |
+| `loginTimeoutMs` | `number` | `0` (no timeout) | If positive, how long to wait for `aws sso login` before reporting failure. The process is never killed — see [What it deliberately does not do](#what-it-deliberately-does-not-do). |
+| `awsCommand`     | `string` | `"aws"`          | The AWS CLI binary to invoke, for setups where it is not on `PATH` under that name. |
+| `providerID`     | `string` | `"amazon-bedrock"` | The opencode provider ID to watch and to read `options.profile` from, for setups where Bedrock is registered under another id. |
+| `profile`        | `string` | unset            | The AWS profile to use. Takes priority over `provider.<providerID>.options.profile`, `AWS_PROFILE` and `AWS_DEFAULT_PROFILE`. |
+
+Any value of the wrong type, or a number that is not positive, is ignored
+and the default is used instead — the plugin never fails to load over a
+bad option.
+
 ## Requirements
 
 - AWS CLI v2 (for `aws sso login` and the token cache format it produces).
@@ -64,9 +91,10 @@ do not have.
 - **No npm release.** Install from the git repository, as above.
 - **No agent-callable refresh tool.** The agent cannot ask the plugin to
   re-authenticate on demand; refresh only happens at the three points above.
-- **No login timeout.** If `aws sso login` opens a browser and nobody
-  completes the flow, the request waits indefinitely. The toast includes
-  the equivalent command to run by hand if that happens.
+- **No login timeout by default.** If `aws sso login` opens a browser and
+  nobody completes the flow, the request waits indefinitely unless
+  `loginTimeoutMs` is set. The toast includes the equivalent command to run
+  by hand if that happens.
 
 ## Compared to other plugins
 
@@ -75,8 +103,8 @@ upfront about how this one differs:
 
 - [**opencode-bedrock-sso**](https://www.npmjs.com/package/opencode-bedrock-sso)
   by Mani Sundararajan. Published on npm under the MIT license; no public
-  repository. It is well engineered and, notably, exposes plugin options
-  this one does not yet have.
+  repository. It is well engineered and exposes its own set of plugin
+  options.
 - [**opencode-aws-bedrock-auth**](https://github.com/favasconcelos/opencode-aws-bedrock-auth)
   by favasconcelos. Available on GitHub and npm.
 
@@ -92,6 +120,5 @@ request. That is a trade the other two made, not a fault in either of
 them — polling `sts get-caller-identity` is simpler and needs no knowledge
 of the token cache's on-disk format.
 
-This plugin is younger than both and has no configuration options yet
-beyond the profile it already reads from opencode's own Bedrock provider
-config.
+This plugin is younger than both. See [Options](#options) above for what it
+now exposes.

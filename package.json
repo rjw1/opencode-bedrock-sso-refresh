@@ -1,6 +1,6 @@
 {
   "name": "opencode-bedrock-sso-refresh",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "opencode plugin that keeps the AWS SSO token behind Amazon Bedrock fresh by reading the AWS CLI token cache.",
   "license": "MIT",

@@ -22,8 +22,9 @@ import {
 //   2. pre-flight - before each Bedrock request, if the cached token is stale
 //   3. reactive   - on the credential error that slips past pre-flight
 //
-// The profile is resolved from provider.amazon-bedrock.options.profile, then
-// AWS_PROFILE. If neither is set the plugin does nothing beyond warning once.
+// The profile is resolved from the plugin's own `profile` option, then
+// provider.<providerID>.options.profile, then AWS_PROFILE. If none is set the
+// plugin does nothing beyond warning once.
 
 type ReauthResult = "not-stale" | "recovered" | "failed" | "disabled" | "no-profile"
 
@@ -61,7 +62,7 @@ const tokenCachePath = (profile: string): string | undefined => {
 // A missing or otherwise unreadable cache file for an SSO-backed profile reads as
 // stale, because an unusable cache is grounds to re-authenticate. Only a profile
 // with no SSO configuration, or a cache whose expiry will not parse, is unknown.
-const tokenState = (profile: string): TokenState => {
+const tokenState = (profile: string, marginMs: number): TokenState => {
   const path = tokenCachePath(profile)
   if (!path) return "unknown"
 
@@ -73,13 +74,25 @@ const tokenState = (profile: string): TokenState => {
   }
 
   try {
-    return freshness((JSON.parse(contents) as { expiresAt?: unknown }).expiresAt, EXPIRY_MARGIN_MS, Date.now())
+    return freshness((JSON.parse(contents) as { expiresAt?: unknown }).expiresAt, marginMs, Date.now())
   } catch {
     return "unknown"
   }
 }
 
-export default (async ({ $, client }) => {
+export default (async ({ $, client }, options) => {
+  const positiveNumber = (value: unknown, fallback: number): number =>
+    typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback
+
+  const marginMs = positiveNumber(options?.["marginMs"], EXPIRY_MARGIN_MS)
+  const toastMs = positiveNumber(options?.["toastMs"], WARNING_TOAST_MS)
+  // 0 or absent means no timeout, which is the existing behaviour: aws sso login
+  // is already bounded by the device code expiry.
+  const loginTimeoutMs = positiveNumber(options?.["loginTimeoutMs"], 0)
+  const awsCommand = typeof options?.["awsCommand"] === "string" ? options["awsCommand"] : "aws"
+  const providerID = typeof options?.["providerID"] === "string" ? options["providerID"] : "amazon-bedrock"
+  const optionProfile = options?.["profile"]
+
   let profile: string | undefined
   const inFlightLogins = new Map<string, Promise<{ ok: boolean; detail: string }>>()
   // Set once a login reports success but tokenState still reads stale, meaning
@@ -91,16 +104,28 @@ export default (async ({ $, client }) => {
     const existing = inFlightLogins.get(target)
     if (existing) return existing
 
-    const attempt = $`aws sso login --profile ${target}`
+    const run = $`${awsCommand} sso login --profile ${target}`
       .quiet()
       .nothrow()
       .then((result) => ({
         ok: result.exitCode === 0,
         detail: (result.stderr.toString().trim() || result.stdout.toString().trim()).slice(-300),
       }))
-      .finally(() => {
-        inFlightLogins.delete(target)
-      })
+
+    // Not killed on timeout: aws sso login exits on its own at device-code
+    // expiry, and killing it mid-flow could leave a partial token cache write.
+    const attempt = (
+      loginTimeoutMs > 0
+        ? Promise.race([
+            run,
+            new Promise<{ ok: boolean; detail: string }>((resolve) =>
+              setTimeout(() => resolve({ ok: false, detail: `timed out after ${loginTimeoutMs}ms` }), loginTimeoutMs),
+            ),
+          ])
+        : run
+    ).finally(() => {
+      inFlightLogins.delete(target)
+    })
 
     inFlightLogins.set(target, attempt)
     return attempt
@@ -125,14 +150,14 @@ export default (async ({ $, client }) => {
   const reauthenticateIfStale = async (resend: boolean): Promise<ReauthResult> => {
     if (!profile) return "no-profile"
     if (autoReauthDisabled) return "disabled"
-    if (tokenState(profile) !== "stale") return "not-stale"
+    if (tokenState(profile, marginMs) !== "stale") return "not-stale"
 
     await log("info", `Token for ${profile} is stale; logging in.`)
     await toast(
       `Token for ${profile} has expired. Opening the browser to re-authenticate... ` +
-        `If none opens, run: aws sso login --profile ${profile}`,
+        `If none opens, run: ${awsCommand} sso login --profile ${profile}`,
       "warning",
-      WARNING_TOAST_MS,
+      toastMs,
     )
     const result = await login(profile)
     if (!result.ok) {
@@ -141,7 +166,7 @@ export default (async ({ $, client }) => {
       return "failed"
     }
 
-    if (tokenState(profile) === "stale") {
+    if (tokenState(profile, marginMs) === "stale") {
       autoReauthDisabled = true
       await log("error", `Circuit breaker tripped for ${profile}; disabling automatic re-authentication.`)
       await toast(
@@ -160,20 +185,20 @@ export default (async ({ $, client }) => {
   }
 
   const ensureSession = async (target: string) => {
-    const check = await $`aws sts get-caller-identity --profile ${target}`.quiet().nothrow()
+    const check = await $`${awsCommand} sts get-caller-identity --profile ${target}`.quiet().nothrow()
     if (check.exitCode === 0) return
 
     const result = await login(target)
     if (!result.ok) {
       const notice = `aws sso login failed for ${target} at startup. Run it manually. ${result.detail}`
       await log("error", notice)
-      await toast(notice, "warning", WARNING_TOAST_MS)
+      await toast(notice, "warning", toastMs)
     }
   }
 
   return {
     config: async (cfg) => {
-      profile = resolveProfileName(undefined, cfg.provider?.["amazon-bedrock"]?.options?.["profile"], process.env)
+      profile = resolveProfileName(optionProfile, cfg.provider?.[providerID]?.options?.["profile"], process.env)
       const credentialSource = otherCredentialSource(process.env)
       if (credentialSource) {
         await log("info", `${credentialSource} is set, so this plugin is not managing credentials.`)
@@ -196,7 +221,7 @@ export default (async ({ $, client }) => {
     // Awaited, so the message visibly waits on the browser flow. That is the
     // point: the request then proceeds against a fresh token instead of failing.
     "chat.params": async (input) => {
-      if (input.model.providerID !== "amazon-bedrock") return
+      if (input.model.providerID !== providerID) return
       await reauthenticateIfStale(false)
     },
 
@@ -225,9 +250,9 @@ export default (async ({ $, client }) => {
       } else if (result === "disabled") {
         await toast(
           `Bedrock credentials failed and automatic re-authentication is disabled ` +
-            `for this session. Run: aws sso login --profile ${profile}. ${message}`,
+            `for this session. Run: ${awsCommand} sso login --profile ${profile}. ${message}`,
           "error",
-          WARNING_TOAST_MS,
+          toastMs,
         )
       }
     },
