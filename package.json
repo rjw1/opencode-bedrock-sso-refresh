@@ -1,0 +1,33 @@
+{
+  "name": "opencode-bedrock-sso-refresh",
+  "version": "0.0.0",
+  "type": "module",
+  "description": "opencode plugin that keeps the AWS SSO token behind Amazon Bedrock fresh by reading the AWS CLI token cache.",
+  "license": "MIT",
+  "author": "bob walker <bob@randomness.org.uk>",
+  "main": "index.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rjw1/opencode-bedrock-sso-refresh.git"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "aws",
+    "bedrock",
+    "sso",
+    "iam-identity-center"
+  ],
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.17.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.17.10",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts"
+  }
+}
