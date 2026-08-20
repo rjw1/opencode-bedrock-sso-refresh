@@ -19,13 +19,14 @@ import {
 // Keeps the AWS SSO token behind the Bedrock provider valid.
 //
 // Points of intervention:
-//   1. startup    - `sts get-caller-identity`, and `aws sso login` if it fails
+//   1. startup    - `aws sso login` if tokenState already reads stale
 //   2. pre-flight - before each Bedrock request, if the cached token is stale
 //   3. reactive   - on the credential error that slips past pre-flight
 //
 // The profile is resolved from the plugin's own `profile` option, then
 // provider.<providerID>.options.profile, then AWS_PROFILE. If none is set the
-// plugin does nothing beyond warning once.
+// plugin does nothing beyond warning once. tokenState is tri-state, and
+// "unknown" -- a profile with no SSO configuration -- must never reach login.
 
 type ReauthResult = "not-stale" | "recovered" | "failed" | "disabled" | "no-profile"
 
@@ -39,25 +40,42 @@ const WARNING_TOAST_MS = 60_000
 // data.message.
 const CREDENTIAL_ERROR = "AWS credential provider failed"
 
-const deriveTokenCachePath = (profile: string): string | undefined => {
+type LoginResult = { ok: boolean; detail: string }
+
+// Pre-flight can start a login, have it fail (browser tab closed, network
+// blip), let the request through anyway, and then the reactive hook fires on
+// the resulting credential error moments later. Without this window the
+// reactive hook would open a second browser tab for the same message.
+const RESULT_CACHE_WINDOW_MS = 30_000
+
+// `ok: false` means the read itself failed -- EMFILE, the file mid-rewrite, not
+// yet created -- which is transient and must not be memoised. `ok: true` with
+// path undefined means the read succeeded and this profile has no SSO config,
+// which is a stable answer.
+const deriveTokenCachePath = (profile: string): { ok: true; path: string | undefined } | { ok: false } => {
   let sections: IniSections
   try {
     sections = parseIni(readFileSync(awsConfigPath(process.env, homedir()), "utf8"))
   } catch {
-    return undefined
+    return { ok: false }
   }
 
   const cacheKey = cacheKeyForProfile(sections, profile)
-  if (!cacheKey) return undefined
-  return join(homedir(), ".aws", "sso", "cache", tokenCacheFilename(cacheKey))
+  if (!cacheKey) return { ok: true, path: undefined }
+  return { ok: true, path: join(homedir(), ".aws", "sso", "cache", tokenCacheFilename(cacheKey)) }
 }
 
 let cachedPath: { profile: string; path: string | undefined } | undefined
 
-// ~/.aws/config does not change mid-session, so resolve the path once.
+// ~/.aws/config does not change mid-session, so a successful read is resolved
+// once. A failed read is retried on the next call instead of being remembered
+// as "not SSO-backed" for the rest of the session.
 const tokenCachePath = (profile: string): string | undefined => {
-  if (cachedPath?.profile !== profile) cachedPath = { profile, path: deriveTokenCachePath(profile) }
-  return cachedPath.path
+  if (cachedPath?.profile === profile) return cachedPath.path
+  const result = deriveTokenCachePath(profile)
+  if (!result.ok) return undefined
+  cachedPath = { profile, path: result.path }
+  return result.path
 }
 
 // A missing or otherwise unreadable cache file for an SSO-backed profile reads as
@@ -95,15 +113,24 @@ export default (async ({ $, client }, options) => {
   const optionProfile = options?.["profile"]
 
   let profile: string | undefined
-  const inFlightLogins = new Map<string, Promise<{ ok: boolean; detail: string }>>()
+  // Keyed by the resolved token cache path, because that is the file the mutex
+  // actually protects; two profiles could in principle share an sso_session and
+  // fall back to the profile name only when no cache path exists.
+  const inFlightLogins = new Map<string, Promise<LoginResult>>()
+  const recentLogins = new Map<string, { result: LoginResult; at: number }>()
   // Set once a login reports success but tokenState still reads stale, meaning
   // the cache-path derivation is wrong on this machine. Without it, a wrong
   // derivation means a browser prompt on every single request, forever.
   let autoReauthDisabled = false
 
-  const login = (target: string) => {
-    const existing = inFlightLogins.get(target)
+  const login = (target: string): Promise<LoginResult> => {
+    const key = tokenCachePath(target) ?? target
+
+    const existing = inFlightLogins.get(key)
     if (existing) return existing
+
+    const cached = recentLogins.get(key)
+    if (cached && Date.now() - cached.at < RESULT_CACHE_WINDOW_MS) return Promise.resolve(cached.result)
 
     const run = $`${awsCommand} sso login --profile ${target}`
       .quiet()
@@ -112,23 +139,38 @@ export default (async ({ $, client }, options) => {
         ok: result.exitCode === 0,
         detail: (result.stderr.toString().trim() || result.stdout.toString().trim()).slice(-300),
       }))
+      .then((result) => {
+        recentLogins.set(key, { result, at: Date.now() })
+        return result
+      })
+
+    // Cleanup is tied to `run`, the underlying command, never to the race below.
+    // A timeout that wins the race must report failure without releasing the
+    // mutex: botocore writes the token cache in place (truncate, write, no
+    // rename, no lock), so a second `aws sso login` starting while the first is
+    // still running can interleave writes and corrupt the file for every AWS
+    // SDK and CLI call on the machine until the user logs in by hand.
+    run.finally(() => {
+      inFlightLogins.delete(key)
+    })
 
     // Not killed on timeout: aws sso login exits on its own at device-code
     // expiry, and killing it mid-flow could leave a partial token cache write.
-    const attempt = (
+    const attempt =
       loginTimeoutMs > 0
         ? Promise.race([
             run,
-            new Promise<{ ok: boolean; detail: string }>((resolve) =>
-              setTimeout(() => resolve({ ok: false, detail: `timed out after ${loginTimeoutMs}ms` }), loginTimeoutMs),
-            ),
+            new Promise<LoginResult>((resolve) => {
+              const timer = setTimeout(
+                () => resolve({ ok: false, detail: `timed out after ${loginTimeoutMs}ms` }),
+                loginTimeoutMs,
+              )
+              timer.unref()
+            }),
           ])
         : run
-    ).finally(() => {
-      inFlightLogins.delete(target)
-    })
 
-    inFlightLogins.set(target, attempt)
+    inFlightLogins.set(key, attempt)
     return attempt
   }
 
@@ -185,27 +227,26 @@ export default (async ({ $, client }, options) => {
     return "recovered"
   }
 
-  const ensureSession = async (target: string) => {
-    const check = await $`${awsCommand} sts get-caller-identity --profile ${target}`.quiet().nothrow()
-    if (check.exitCode === 0) return
-
-    const result = await login(target)
-    if (!result.ok) {
-      const notice = `aws sso login failed for ${target} at startup. Run it manually. ${result.detail}`
-      await log("error", notice)
-      await toast(notice, "warning", toastMs)
-    }
-  }
-
   return {
+    // Logs only, never toasts: the TUI is not confirmed to exist this early, so
+    // a startup failure relies on pre-flight's toast once a request is made,
+    // by which point the TUI definitely exists. Login is gated on tokenState,
+    // not an sts probe: that also reaches "stale", but cheaper, without the
+    // false positives an unrelated network or IAM fault would produce, and
+    // without blocking server init on an unbounded call to a possibly
+    // unreachable network.
     config: async (cfg) => {
-      profile = resolveProfileName(optionProfile, cfg.provider?.[providerID]?.options?.["profile"], process.env)
       const credentialSource = otherCredentialSource(process.env)
       if (credentialSource) {
-        await log("info", `${credentialSource} is set, so this plugin is not managing credentials.`)
+        // Cleared before the await below, not after, so a request landing
+        // during that round-trip cannot still see a profile set and reach
+        // reauthenticateIfStale for a setup this plugin was told to skip.
         profile = undefined
+        await log("info", `${credentialSource} is set, so this plugin is not managing credentials.`)
         return
       }
+
+      profile = resolveProfileName(optionProfile, cfg.provider?.[providerID]?.options?.["profile"], process.env)
       if (!profile) {
         await log("warn", "No AWS profile configured for Bedrock, so SSO checks are disabled.")
         return
@@ -215,8 +256,14 @@ export default (async ({ $, client }, options) => {
           "warn",
           `${profile} sets neither sso_session nor sso_start_url, so pre-flight token checks are disabled.`,
         )
+        return
       }
-      await ensureSession(profile)
+      if (tokenState(profile, marginMs) !== "stale") return
+
+      const result = await login(profile)
+      if (!result.ok) {
+        await log("error", `aws sso login failed for ${profile} at startup. Run it manually. ${result.detail}`)
+      }
     },
 
     // Awaited, so the message visibly waits on the browser flow. That is the
@@ -229,7 +276,7 @@ export default (async ({ $, client }, options) => {
     event: async ({ event }) => {
       if (event.type !== "session.error") return
 
-      const message = event.properties.error?.data.message
+      const message = event.properties.error?.data?.message
       if (typeof message !== "string" || !message.includes(CREDENTIAL_ERROR)) return
 
       // Re-check before logging in. A valid token means the failure was not
