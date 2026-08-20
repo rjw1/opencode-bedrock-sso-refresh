@@ -21,21 +21,39 @@ export const parseIni = (text: string): IniSections => {
 
     const header = /^\[(.+)\]$/.exec(line)
     if (header) {
-      // botocore strips surrounding quotes from section names, so
-      // [profile "with space"] and [profile with space] are the same profile.
-      const name = header[1].trim().replace(/^(profile\s+)?"(.*)"$/, "$1$2")
+      const name = normaliseSectionName(header[1].trim())
       if (!sections[name]) sections[name] = {}
       current = sections[name]
       continue
     }
 
     if (!current) continue
-    const separator = line.indexOf("=")
-    if (separator < 0) continue
+    // RawConfigParser accepts both '=' and ':'. Whichever appears first wins,
+    // so a value with a scheme (https:) after the '=' is never truncated.
+    const delimiters = [line.indexOf("="), line.indexOf(":")].filter((index) => index >= 0)
+    if (delimiters.length === 0) continue
+    const separator = Math.min(...delimiters)
     current[line.slice(0, separator).trim()] = line.slice(separator + 1).trim()
   }
 
   return sections
+}
+
+// botocore runs the section name through shlex.split, which strips a matching
+// pair of single or double quotes, so [profile "with space"] and
+// [profile 'with space'] and [profile with space] are the same profile.
+// shlex.split raises on an unbalanced quote; we cannot raise mid-parse, so
+// unbalanced input is left untouched and simply fails to match any lookup
+// afterwards, which is the same safe fallback as an unrecognised section.
+const normaliseSectionName = (raw: string): string => {
+  const parts = /^(profile\s+)?(.*)$/.exec(raw)
+  const prefix = parts?.[1] ?? ""
+  const name = parts?.[2] ?? raw
+  const quote = name[0]
+  if (name.length >= 2 && (quote === '"' || quote === "'") && name[name.length - 1] === quote) {
+    return prefix + name.slice(1, -1)
+  }
+  return prefix + name
 }
 
 // The AWS CLI names its token cache after the sha1 of the sso-session name for
@@ -61,6 +79,12 @@ export const cacheKeyForProfile = (sections: IniSections, profile: string): stri
 export const nonEmptyString = (value: unknown): string | undefined =>
   typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
 
+// Its string counterpart above; kept alongside it so both option-validation
+// rules are covered by the same test file rather than living unreachably
+// inside the plugin factory.
+export const positiveNumber = (value: unknown, fallback: number): number =>
+  typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback
+
 // AWS_DEFAULT_PROFILE is honoured by botocore and was previously ignored here.
 export const resolveProfileName = (
   pluginProfile: unknown,
@@ -76,7 +100,9 @@ export const awsConfigPath = (env: Record<string, string | undefined>, home: str
   const configured = nonEmptyString(env["AWS_CONFIG_FILE"])
   if (!configured) return `${home}/.aws/config`
   // The shell expands ~ before a program sees it, but a value read from a config
-  // file or a systemd unit arrives literally.
+  // file or a systemd unit arrives literally. os.path.expanduser, which
+  // botocore calls, expands both a bare '~' and a leading '~/'.
+  if (configured === "~") return home
   return configured.startsWith("~/") ? `${home}/${configured.slice(2)}` : configured
 }
 
@@ -90,6 +116,23 @@ export const freshness = (expiresAt: unknown, marginMs: number, now: number): To
   const expiry = Date.parse(expiresAt)
   if (Number.isNaN(expiry)) return "unknown"
   return expiry - now > marginMs ? "fresh" : "stale"
+}
+
+// Lets the breaker at the reactive hook tell "the cache path is wrong" (file
+// absent) apart from "marginMs exceeds this token's remaining lifetime" (file
+// present, expiry parses, expiry is in the future). Takes file contents, not a
+// path, to keep this module free of I/O.
+export const parseExpiryEpochMs = (contents: string): number | undefined => {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(contents)
+  } catch {
+    return undefined
+  }
+  const expiresAt = (parsed as { expiresAt?: unknown } | null)?.expiresAt
+  if (typeof expiresAt !== "string") return undefined
+  const epoch = Date.parse(expiresAt)
+  return Number.isNaN(epoch) ? undefined : epoch
 }
 
 // opencode's own Bedrock provider prefers these over a profile, so when any is

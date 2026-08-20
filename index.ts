@@ -9,7 +9,9 @@ import {
   freshness,
   nonEmptyString,
   otherCredentialSource,
+  parseExpiryEpochMs,
   parseIni,
+  positiveNumber,
   resolveProfileName,
   tokenCacheFilename,
   type IniSections,
@@ -99,10 +101,30 @@ const tokenState = (profile: string, marginMs: number): TokenState => {
   }
 }
 
-export default (async ({ $, client }, options) => {
-  const positiveNumber = (value: unknown, fallback: number): number =>
-    typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback
+// Distinguishes the breaker's two causes: a missing cache file after a
+// successful login means the path derivation is wrong on this machine, but a
+// cache file that exists with a future expiry just inside marginMs means
+// marginMs is longer than this session's token lifetime -- a config problem
+// with a different fix. `undefined` covers both "no cache path", "unreadable"
+// and "unparseable expiry", which all fall back to the derivation-wrong message.
+const marginExceedsLifetime = (profile: string): number | undefined => {
+  const path = tokenCachePath(profile)
+  if (!path) return undefined
 
+  let contents: string
+  try {
+    contents = readFileSync(path, "utf8")
+  } catch {
+    return undefined
+  }
+
+  const expiry = parseExpiryEpochMs(contents)
+  if (expiry === undefined) return undefined
+  const remainingMs = expiry - Date.now()
+  return remainingMs > 0 ? remainingMs : undefined
+}
+
+export default (async ({ $, client }, options) => {
   const marginMs = positiveNumber(options?.["marginMs"], EXPIRY_MARGIN_MS)
   const toastMs = positiveNumber(options?.["toastMs"], WARNING_TOAST_MS)
   // 0 or absent means no timeout, which is the existing behaviour: aws sso login
@@ -212,9 +234,14 @@ export default (async ({ $, client }, options) => {
     if (tokenState(profile, marginMs) === "stale") {
       autoReauthDisabled = true
       await log("error", `Circuit breaker tripped for ${profile}; disabling automatic re-authentication.`)
+      const remainingMs = marginExceedsLifetime(profile)
       await toast(
-        `aws sso login for ${profile} succeeded but the token still reads as stale. ` +
-          `Automatic re-authentication is disabled for the rest of this session.`,
+        remainingMs === undefined
+          ? `aws sso login for ${profile} succeeded but the token still reads as stale. ` +
+              `Automatic re-authentication is disabled for the rest of this session.`
+          : `aws sso login for ${profile} succeeded, but marginMs (${marginMs}ms) exceeds the ` +
+              `${remainingMs}ms remaining before this token expires. Lower marginMs below ${remainingMs}ms. ` +
+              `Automatic re-authentication is disabled for the rest of this session.`,
         "error",
       )
       return "failed"

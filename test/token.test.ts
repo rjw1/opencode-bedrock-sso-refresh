@@ -5,7 +5,9 @@ import {
   cacheKeyForProfile,
   freshness,
   otherCredentialSource,
+  parseExpiryEpochMs,
   parseIni,
+  positiveNumber,
   resolveProfileName,
   tokenCacheFilename,
 } from "../token.ts"
@@ -29,6 +31,24 @@ test("parseIni ignores keys before any section header", () => {
   assert.deepEqual(parseIni("stray = 1\n[profile p]\nregion = eu-west-2\n"), {
     "profile p": { region: "eu-west-2" },
   })
+})
+
+// RawConfigParser, which botocore uses, accepts ':' as well as '=' for key/value.
+test("parseIni accepts a colon as the key/value delimiter", () => {
+  const sections = parseIni("[profile p]\nsso_session: mysess\n")
+  assert.equal(sections["profile p"]?.["sso_session"], "mysess")
+})
+
+// A naive "split on first colon" would truncate this to key `sso_start_url = https`
+// and destroy the value, because the scheme's colon comes after the '='.
+test("parseIni does not let a colon in the value truncate an sso_start_url", () => {
+  const sections = parseIni("[profile p]\nsso_start_url = https://example.awsapps.com/start#/\n")
+  assert.equal(sections["profile p"]?.["sso_start_url"], "https://example.awsapps.com/start#/")
+})
+
+test("parseIni splits on whichever delimiter comes first when both are present", () => {
+  const sections = parseIni("[profile p]\na:b=c\n")
+  assert.equal(sections["profile p"]?.["a"], "b=c")
 })
 
 test("cacheKeyForProfile prefers sso_session over sso_start_url", () => {
@@ -105,6 +125,27 @@ test("cacheKeyForProfile matches a quoted section name", () => {
   assert.equal(cacheKeyForProfile(sections, "with space"), "https://x/start")
 })
 
+// shlex.split, which botocore uses on the section name, strips single quotes
+// exactly as it strips double quotes.
+test("cacheKeyForProfile matches a single-quoted section name", () => {
+  const sections = parseIni("[profile 'with space']\nsso_start_url = https://x/start\n")
+  assert.equal(cacheKeyForProfile(sections, "with space"), "https://x/start")
+})
+
+// shlex.split raises on this input; we cannot raise mid-parse, so it must
+// simply fail to match rather than take down the rest of the file.
+test("cacheKeyForProfile leaves an unbalanced quote unmatched, not throwing", () => {
+  assert.doesNotThrow(() => {
+    const sections = parseIni('[profile "oops]\nsso_start_url = https://x/start\n')
+    assert.equal(cacheKeyForProfile(sections, "oops"), undefined)
+  })
+})
+
+test("cacheKeyForProfile matches a plain unquoted section name unaffected by normalisation", () => {
+  const sections = parseIni("[profile plain]\nsso_start_url = https://x/start\n")
+  assert.equal(cacheKeyForProfile(sections, "plain"), "https://x/start")
+})
+
 test("resolveProfileName prefers the plugin option over everything", () => {
   const env = { AWS_PROFILE: "env", AWS_DEFAULT_PROFILE: "envdefault" }
   assert.equal(resolveProfileName("opt", "provider", env), "opt")
@@ -131,6 +172,11 @@ test("resolveProfileName ignores empty and non-string values", () => {
 
 test("awsConfigPath expands a leading tilde in AWS_CONFIG_FILE", () => {
   assert.equal(awsConfigPath({ AWS_CONFIG_FILE: "~/custom/config" }, "/home/b"), "/home/b/custom/config")
+})
+
+// os.path.expanduser, which botocore calls, also expands a bare '~'.
+test("awsConfigPath expands a bare tilde in AWS_CONFIG_FILE", () => {
+  assert.equal(awsConfigPath({ AWS_CONFIG_FILE: "~" }, "/home/b"), "/home/b")
 })
 
 test("awsConfigPath uses AWS_CONFIG_FILE verbatim when absolute", () => {
@@ -174,4 +220,65 @@ test("otherCredentialSource needs both halves of web identity", () => {
 
 test("otherCredentialSource is undefined for a plain SSO setup", () => {
   assert.equal(otherCredentialSource({ AWS_PROFILE: "p" }), undefined)
+})
+
+test("positiveNumber accepts a finite number greater than zero", () => {
+  assert.equal(positiveNumber(5, 1), 5)
+})
+
+test("positiveNumber falls back for zero", () => {
+  assert.equal(positiveNumber(0, 1), 1)
+})
+
+test("positiveNumber falls back for a negative number", () => {
+  assert.equal(positiveNumber(-5, 1), 1)
+})
+
+test("positiveNumber falls back for a non-numeric string", () => {
+  assert.equal(positiveNumber("5", 1), 1)
+})
+
+test("positiveNumber falls back for NaN", () => {
+  assert.equal(positiveNumber(Number.NaN, 1), 1)
+})
+
+test("positiveNumber falls back for Infinity", () => {
+  assert.equal(positiveNumber(Number.POSITIVE_INFINITY, 1), 1)
+})
+
+test("positiveNumber falls back for null", () => {
+  assert.equal(positiveNumber(null, 1), 1)
+})
+
+test("positiveNumber falls back for undefined", () => {
+  assert.equal(positiveNumber(undefined, 1), 1)
+})
+
+test("positiveNumber falls back for an array", () => {
+  assert.equal(positiveNumber([5], 1), 1)
+})
+
+test("positiveNumber falls back for an object", () => {
+  assert.equal(positiveNumber({ value: 5 }, 1), 1)
+})
+
+test("parseExpiryEpochMs reads the expiry as epoch milliseconds", () => {
+  const contents = JSON.stringify({ expiresAt: "2026-08-19T12:05:00Z" })
+  assert.equal(parseExpiryEpochMs(contents), Date.parse("2026-08-19T12:05:00Z"))
+})
+
+test("parseExpiryEpochMs is undefined when expiresAt is missing", () => {
+  assert.equal(parseExpiryEpochMs(JSON.stringify({})), undefined)
+})
+
+test("parseExpiryEpochMs is undefined for unparseable JSON", () => {
+  assert.equal(parseExpiryEpochMs("not json"), undefined)
+})
+
+test("parseExpiryEpochMs is undefined when expiresAt is not a date string", () => {
+  assert.equal(parseExpiryEpochMs(JSON.stringify({ expiresAt: "not a date" })), undefined)
+})
+
+test("parseExpiryEpochMs is undefined when expiresAt is not a string", () => {
+  assert.equal(parseExpiryEpochMs(JSON.stringify({ expiresAt: 123 })), undefined)
 })
