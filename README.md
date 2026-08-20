@@ -7,14 +7,14 @@ expired token mid-conversation.
 ## What it does
 
 It reads `expiresAt` from the AWS CLI's own SSO token cache — the same file
-`aws sso login` writes, located by hashing the profile's `sso-session` name
-or, for legacy profiles, its `sso_start_url` — and re-authenticates five
-minutes before that timestamp is reached. There are three points of
-intervention:
+`aws sso login` writes, located by hashing the value of the profile's
+`sso_session` key or, for legacy profiles, its `sso_start_url` — and
+re-authenticates five minutes before that timestamp is reached. There are
+three points of intervention:
 
-1. **Startup.** On load, it runs `aws sts get-caller-identity` for the
-   configured profile and, if that fails, `aws sso login`. This catches a
-   token that expired before opencode was even started.
+1. **Startup.** On load, it checks the cached expiry for the configured
+   profile and, if the token is already stale, runs `aws sso login`. This
+   catches a token that expired before opencode was even started.
 2. **Pre-flight.** Before each request to Bedrock, it checks the cached
    expiry. If the token is stale, it opens the browser and waits for
    `aws sso login` to finish before letting the request proceed.
@@ -23,10 +23,21 @@ intervention:
    cache and, if the token really has gone stale, re-authenticates and asks
    you to resend the message.
 
-If neither `provider.amazon-bedrock.options.profile` nor `AWS_PROFILE` names
-an SSO-backed profile, the plugin does nothing beyond a one-time notice. If
-another AWS credential source is already configured (see below), it steps
-aside silently instead.
+The profile is resolved in this order: the plugin's own `profile` option,
+then `provider.<providerID>.options.profile` (`amazon-bedrock` by default),
+then `AWS_PROFILE`, then `AWS_DEFAULT_PROFILE`. If none of these names a
+profile, or the profile that is named has no `sso_session` or
+`sso_start_url` set, startup logs that fact to opencode's log
+(`client.app.log` — there is no toast this early) and does not attempt a
+login. That is not quite the end of it for the second case: pre-flight and
+the reactive hook stay registered and keep evaluating the same cached-expiry
+check on every subsequent request. Finding no cache to read, that check
+always comes back "not stale", so nothing further happens — it is a no-op
+repeated on every request, not a one-off notice.
+
+If another AWS credential source is already configured (see below), the
+plugin also logs that once to opencode's log and does not attempt a login,
+for as long as that credential source remains set.
 
 ## Install
 
@@ -68,14 +79,24 @@ Any value of the wrong type, or a number that is not positive, is ignored
 and the default is used instead — the plugin never fails to load over a
 bad option.
 
+`marginMs` has no enforced ceiling, but it must stay shorter than the SSO
+session's token lifetime (commonly eight hours, though Identity Center
+administrators can set it lower). A margin longer than that makes even a
+freshly minted token read as stale, which trips the circuit breaker on the
+very first request and disables automatic re-authentication for the rest
+of the session.
+
 ## Requirements
 
+- opencode `>=1.17.0` — the floor this plugin's tuple-form options,
+  `client.app.log` calls and TypeScript-as-`main` all require.
 - AWS CLI v2 (for `aws sso login` and the token cache format it produces).
 - An SSO-backed profile in `~/.aws/config` — one with `sso_session` (the
   modern, `sso-session`-block style) or the older `sso_start_url` set
   directly on the profile.
-- That profile named via `provider.amazon-bedrock.options.profile` in your
-  opencode config, or `AWS_PROFILE` in the environment.
+- That profile resolved by one of `profile` (the plugin option),
+  `provider.<providerID>.options.profile`, `AWS_PROFILE` or
+  `AWS_DEFAULT_PROFILE` — see [Options](#options) for the precedence order.
 
 ## When it no-ops
 
@@ -106,19 +127,33 @@ upfront about how this one differs:
   repository. It is well engineered and exposes its own set of plugin
   options.
 - [**opencode-aws-bedrock-auth**](https://github.com/favasconcelos/opencode-aws-bedrock-auth)
-  by favasconcelos. Available on GitHub and npm.
+  by favasconcelos. Also MIT licensed, with a public repository at that
+  address, and available on npm.
 
-Both keep the session healthy by polling `aws sts get-caller-identity` and
-throttling that check — every five minutes for `opencode-bedrock-sso`, every
-twenty for `opencode-aws-bedrock-auth`. That is a reasonable design, but it
-means a token that expires shortly after a healthy check leaves a window,
-up to the throttle interval wide, in which requests simply fail until the
-next poll fires. This plugin reads the expiry timestamp directly out of the
-token cache instead of inferring health from a probe request, so there is
-no such window: a token due to expire is caught before it does, on every
-request. That is a trade the other two made, not a fault in either of
-them — polling `sts get-caller-identity` is simpler and needs no knowledge
-of the token cache's on-disk format.
+Neither of the other two runs a background timer — "polling" overstates
+it. Both check lazily on a request path with a throttle, the same shape
+this plugin also uses: it too checks on a request path rather than on a
+schedule. The real difference is what the check consults, not how often it
+fires. `opencode-bedrock-sso` and `opencode-aws-bedrock-auth` both ask AWS
+STS whether the current credentials work right now, via
+`aws sts get-caller-identity`, and throttle that question to keep it
+affordable — every five minutes for `opencode-bedrock-sso`, every twenty
+for `opencode-aws-bedrock-auth`. A token that expires shortly after a
+healthy check therefore leaves a window, up to the throttle interval wide,
+in which requests simply fail until the next check fires. This plugin
+reads the expiry timestamp out of the token cache instead of asking STS,
+so it needs no throttle and has no such window: a token due to expire is
+caught before it does, on every request. That is a trade the other two
+made, not a fault in either of them — asking STS is simpler and needs no
+knowledge of the token cache's on-disk format.
+
+The two also differ in when the check runs at all. `opencode-bedrock-sso`
+hooks `chat.params`, the same point this plugin checks from, so its
+throttled STS check fires on every conversational turn against a matching
+provider. `opencode-aws-bedrock-auth` does not hook `chat.params`: it
+checks once at startup and again only before a `bash` or `task` tool call,
+so a plain conversation that never calls one of those tools is not checked
+again after startup.
 
 This plugin is younger than both. See [Options](#options) above for what it
 now exposes.
